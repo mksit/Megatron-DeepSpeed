@@ -56,8 +56,8 @@ class MixedFusedLayerNorm(torch.nn.Module):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = torch.Size(normalized_shape)
         self.eps = eps
-        self.weight = Parameter(torch.Tensor(*normalized_shape))
-        self.bias = Parameter(torch.Tensor(*normalized_shape))
+        self.weight = Parameter(torch.empty(*normalized_shape))
+        self.bias = Parameter(torch.empty(*normalized_shape))
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
         self.sequence_parallel = sequence_parallel
@@ -83,6 +83,9 @@ class MixedFusedLayerNorm(torch.nn.Module):
     if not input.is_cuda:
         print("WARNING! The input of FusedLayerNorm should be on the GPU."
               "This warning should only be triggered in the FusedLayerNorm unit tests.")
+        return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
+
+    if torch._subclasses.fake_tensor.is_fake(input):
         return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
 
     if self.no_persist_layer_norm:

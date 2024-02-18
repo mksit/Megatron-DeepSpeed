@@ -1554,9 +1554,12 @@ class ParallelTransformer(MegatronModule):
         self.num_layers = _get_num_layers(args, model_type,
                                           layer_type==LayerType.decoder)
 
+        # self.drop_path_rates = [
+        #     rate.item() for rate in
+        #     torch.linspace(0, self.drop_path_rate, config.num_layers)]
         self.drop_path_rates = [
-            rate.item() for rate in
-            torch.linspace(0, self.drop_path_rate, config.num_layers)]
+            rate for rate in
+            np.linspace(0, self.drop_path_rate, config.num_layers)]
 
         self.retro_layer_numbers = None
         if model_type == ModelType.retro_decoder:

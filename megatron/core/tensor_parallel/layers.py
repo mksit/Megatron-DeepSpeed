@@ -192,9 +192,13 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
-            # Build the mask.
-            input_mask = (input_ < self.vocab_start_index) | \
-                         (input_ >= self.vocab_end_index)
+            if isinstance(input_, torch._subclasses.FakeTensor):
+                # Dummy input mask for fake input tensor
+                input_mask = torch.empty_like(input_, dtype=torch.bool)
+            else:
+                # Build the mask.
+                input_mask = (input_ < self.vocab_start_index) | \
+                            (input_ >= self.vocab_end_index)
             # Mask the input.
             masked_input = input_.clone() - self.vocab_start_index
             masked_input[input_mask] = 0

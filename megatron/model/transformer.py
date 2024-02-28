@@ -19,8 +19,9 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 import deepspeed
-from deepspeed.moe.layer import MoE
+# from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
+from compactron.layers import MoE
 
 try:
     from deepspeed.sequence.layer import DistributedAttention
@@ -951,10 +952,12 @@ class ParallelTransformerLayer(MegatronModule):
                 self.mlp = ParallelMLP(config)
             else: # DeepSpeed's MoE
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
+                # DeepSpeed MoE's layer is not compatible with fake tensors,
+                # so we use our own MoE and modify to pass a factory function instead of an instance
                 self.mlp = MoE(args.hidden_size,
-                                ParallelMLP(config,
-                                    moe=True,
-                                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
+                                lambda: ParallelMLP(config,
+                                            moe=True,
+                                            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
                                 num_experts=self.num_experts,
                                 ep_size=args.moe_expert_parallel_size,
                                 k=args.topk,

@@ -135,6 +135,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
+        self.torch_softmax = torch.nn.Softmax(dim=-1)
 
         assert (
             self.scale is None or softmax_in_fp32
@@ -196,7 +197,8 @@ class FusedScaleMaskSoftmax(nn.Module):
         if self.scale is not None:
             input = input * self.scale
         mask_output = self.mask_func(input, mask) if mask is not None else input
-        probs = torch.nn.Softmax(dim=-1)(mask_output)
+        #mksit: Moved the definition of Softmax module to the constructor for make_fx tracing 
+        probs = self.torch_softmax(mask_output)
 
         if self.input_in_float16 and self.softmax_in_fp32:
             if self.input_in_fp16:

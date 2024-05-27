@@ -954,10 +954,7 @@ class ParallelTransformerLayer(MegatronModule):
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
                 # DeepSpeed MoE's layer is not compatible with fake tensors,
                 # so we use our own MoE and modify to pass a factory function instead of an instance
-                self.mlp = MoE(args.hidden_size,
-                                lambda: ParallelMLP(config,
-                                            moe=True,
-                                            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
+                self.mlp = MoE(config,
                                 num_experts=self.num_experts,
                                 ep_size=args.moe_expert_parallel_size,
                                 k=args.topk,

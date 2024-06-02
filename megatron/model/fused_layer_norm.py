@@ -11,6 +11,7 @@ from torch.nn import init
 import importlib
 from torch.nn import functional as F
 import inspect
+from torch._guards import detect_fake_mode
 
 from megatron.core.utils import make_viewless_tensor
 
@@ -85,7 +86,9 @@ class MixedFusedLayerNorm(torch.nn.Module):
               "This warning should only be triggered in the FusedLayerNorm unit tests.")
         return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
 
-    if torch._subclasses.fake_tensor.is_fake(input):
+    # Compactron: use Pytorch's layer_norm if fake mode is detected
+    is_fake_mode = detect_fake_mode(input)
+    if is_fake_mode is not None:
         return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
 
     if self.no_persist_layer_norm:

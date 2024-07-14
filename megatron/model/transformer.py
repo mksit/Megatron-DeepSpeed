@@ -19,6 +19,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.model.deepseek import DeepSeekMoE, DeepSeekTransformerConfig
 import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
@@ -967,7 +968,14 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP
         self.num_experts = num_experts
-        if args.num_experts_switch is not None:
+        if isinstance(config, DeepSeekTransformerConfig): # DeepSeek
+            if self.num_experts <= 1: # dense, not MoE
+                self.mlp = ParallelMLP(config)
+            else: # DeepSeek's MoE
+                enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
+                self.mlp = DeepSeekMoE(config, 
+                                       enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
+        elif args.num_experts_switch is not None:
             self.mlp = SwitchMLP(config) # Megatron-LM's MoE
         else:
             if self.num_experts <= 1: # dense, not MoE

@@ -203,7 +203,7 @@ class DeepSeekV2Model(MegatronModule):
             encoder_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
-            num_experts=args.num_experts)
+            num_experts=[config.num_routed_experts])
 
         if not args.untie_embeddings_and_output_weights:
             self.initialize_word_embeddings()

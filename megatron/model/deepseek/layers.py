@@ -354,14 +354,14 @@ class MoELayer(Module):
             self.timers(MOE_DISPATCH).start()
         
         # Dispatch the tokens to other ep ranks according to the top-k indices via all-to-all
-        dispatched_states, num_tokens_per_expert = self.token_dispatcher.token_permutation(
+        dispatched_states, self.num_tokens_per_expert = self.token_dispatcher.token_permutation(
             hidden_states, topk_weight, topk_idx)
 
         if self.wall_clock_breakdown:
             self.timers(MOE_DISPATCH).stop()
 
         # Compute the expert outputs
-        expert_output = self.experts(dispatched_states, num_tokens_per_expert)
+        expert_output = self.experts(dispatched_states, self.num_tokens_per_expert)
 
         if self.wall_clock_breakdown:
             self.timers(MOE_GATHER).start()
@@ -441,4 +441,4 @@ class DeepSeekMoE(nn.Module):
         y = self.moe(identity)
         if self.config.num_shared_experts is not None:
             y = y + self.shared_experts(identity)[0]
-        return y
+        return y, self.moe.l_aux, self.moe.num_tokens_per_expert

@@ -46,7 +46,7 @@ megatron_args = {
     "onnx_safe": False,
     "swiglu": True,
     "bias_gelu_fusion": False,
-    "transformer_impl": "",
+    "transformer_impl": "local",
     "fp8_interval": False,
     "tensor_model_parallel_size": 1,
     "no_persist_layer_norm": False,
@@ -257,21 +257,21 @@ def get_deepseekv2_model(args_others, mp_size=1):
     from megatron.initialize import initialize_megatron
     from megatron.model.deepseek.transformer_config import add_deepseek_arguments
 
-    args_defaults = {
+    external_args = {
         'vocab_file': get_test_path('gpt2-vocab.json'),
         'merge_file': get_test_path('gpt2-merges.txt'),
         'tokenizer_type': 'GPT2BPETokenizer',
     }
 
-    args_defaults.update(args_others)
-    args_defaults['tensor_model_parallel_size'] = mp_size
+    external_args.update(args_others)
+    external_args['tensor_model_parallel_size'] = mp_size
 
-    args_defaults.update(megatron_args)
+    external_args.update(megatron_args)
 
     # setting "make-vocab-size-divisible-by" to avoid word-embedding size change in resizing testing.
     sys.argv.extend(['--make-vocab-size-divisible-by', str(1)])
 
-    initialize_megatron(args_defaults=args_defaults, ignore_unknown_args=True, extra_args_provider=add_deepseek_arguments)
+    initialize_megatron(external_args=external_args, ignore_unknown_args=True, extra_args_provider=add_deepseek_arguments)
     args = get_args()
     args.model_type = ModelType.encoder_or_decoder
 
@@ -332,3 +332,8 @@ class TestDeepSeekV2Model(DistributedTest):
         expected_shape = (*inputs[0].shape, args.padded_vocab_size)
 
         assert expected_shape == outputs[0].shape, f"Expected {expected_shape}, but got {outputs[0].shape}"
+
+        assert model.module.module.language_model.num_experts == [4], f"Expected [4], but got {model.module.module.language_model.num_experts}"
+
+        moe_module = model.module.module.language_model.encoder.layers[1].mlp
+        assert isinstance(moe_module, DeepSeekMoE), f"Expected DeepSeekMoE, but got {type(moe_module)}"

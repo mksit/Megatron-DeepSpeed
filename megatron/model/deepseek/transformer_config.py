@@ -43,3 +43,11 @@ class DeepSeekTransformerConfig(TransformerConfig):
 
     # Number of groups for routed experts.
     num_expert_groups: int = None
+
+    # DeepSeek use SwigGLU by default
+    swiglu: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.swiglu:
+            self.gated_linear_unit = True

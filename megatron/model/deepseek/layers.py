@@ -13,7 +13,7 @@ import torch.distributed as dist
 from deepspeed.utils import groups, log_dist
 from deepspeed.utils.timer import SynchronizedWallClockTimer
 
-from megatron import get_args, print_rank_0
+from megatron.global_vars import get_args
 from megatron.model.module import MegatronModule 
 from megatron.core import parallel_state, tensor_parallel, mpu
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
@@ -45,14 +45,14 @@ class ParallelMLP(MegatronModule):
 
         self.add_bias = False # Disable bias for now
 
-        # ffn_hidden_size = config.ffn_hidden_size
-        # if config.gated_linear_unit:
-        #     ffn_hidden_size *= 2
+        _ffn_hidden_size = ffn_hidden_size
+        if config.gated_linear_unit:
+            _ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
-            ffn_hidden_size,
+            _ffn_hidden_size,
             config=config,
             init_method=config.init_method,
             bias=self.add_bias,
@@ -64,17 +64,17 @@ class ParallelMLP(MegatronModule):
 
         self.bias_gelu_fusion = False
         self.activation_func = None
-        self.swiglu = args.swiglu
+        self.swiglu = config.swiglu
 
-        if args.openai_gelu:
-            self.activation_func = openai_gelu
-        elif args.onnx_safe:
-            self.activation_func = erf_gelu
-        elif args.swiglu:
+        if self.swiglu:
             def swiglu(x):
                 x = torch.chunk(x, 2, dim=-1)
                 return F.silu(x[0]) * x[1]
             self.activation_func = swiglu
+        elif args.openai_gelu:
+            self.activation_func = openai_gelu
+        elif args.onnx_safe:
+            self.activation_func = erf_gelu
         elif args.squared_relu:
             def squared_relu(x):
                 return torch.pow(F.relu(x), 2)
@@ -112,7 +112,7 @@ class ParallelMLP(MegatronModule):
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
-    
+
 
 class TopKGate(Module):
     def __init__(self, config: DeepSeekTransformerConfig) -> None:

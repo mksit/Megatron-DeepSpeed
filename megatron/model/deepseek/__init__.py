@@ -1,5 +1,2 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-'''Copyright The Microsoft DeepSpeed Team'''
+from .layers import DeepSeekMoE
+from .transformer_config import DeepSeekTransformerConfig

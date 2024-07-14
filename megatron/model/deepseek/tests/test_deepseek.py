@@ -31,19 +31,21 @@ def initialize_expert_parallel(ep_size: int):
     return ep_group
 
 
+megatron_args = types.SimpleNamespace(
+    openai_gelu=False,
+    onnx_safe=False,
+    swiglu=True,
+    bias_gelu_fusion=False,
+    transformer_impl="",
+    cache_fp8_weight=False,
+    fp8_interval=False,
+    cache_fp8_weight_fwd=False,
+    tensor_model_parallel_size=1,
+)
+
+
 def initialize_moe_model():
-    args = types.SimpleNamespace(
-        swiglu=False,
-        openai_gelu=True,
-        onnx_safe=False,
-        bias_gelu_fusion=False,
-        transformer_impl="",
-        cache_fp8_weight=False,
-        fp8_interval=False,
-        cache_fp8_weight_fwd=False,
-        tensor_model_parallel_size=1,
-    )
-    initialize_megatron_states(args)
+    initialize_megatron_states(megatron_args)
 
     config = DeepSeekTransformerConfig(
         num_attention_heads=4,
@@ -184,18 +186,7 @@ class TestDeepSeekMoE(DistributedTest):
     world_size = 2
 
     def test_constructor(self):
-        args = types.SimpleNamespace(
-            swiglu=False,
-            openai_gelu=True,
-            onnx_safe=False,
-            bias_gelu_fusion=False,
-            transformer_impl="",
-            cache_fp8_weight=False,
-            fp8_interval=False,
-            cache_fp8_weight_fwd=False,
-            tensor_model_parallel_size=1,
-        )
-        initialize_megatron_states(args)
+        initialize_megatron_states(megatron_args)
 
         config = DeepSeekTransformerConfig(
             num_attention_heads=4,
@@ -211,8 +202,9 @@ class TestDeepSeekMoE(DistributedTest):
         moe_model = DeepSeekMoE(config)
 
         num_weights = sum([p.numel() for p in moe_model.parameters()])
+        print([p.shape for p in moe_model.parameters()])
 
-        experted0 = (16 * 32 * 2 ) * 2 + (16 * 64 *  2) + 16 * 4
+        experted0 = (16 * 32 * 2 + 32 * 16) * 2 + (16 * 64 * 2 + 16 * 64) + 16 * 4
         assert num_weights == experted0, f"Expected {experted0} parameters, but got {num_weights}"
 
         assert moe_model.num_local_routed_experts == 2, f"Expected 2 local routed experts, but got {moe_model.num_local_routed_experts}"
@@ -253,4 +245,4 @@ class TestDeepSeekMoE(DistributedTest):
         expected1 = torch.tensor([
             [0.9, 0.3], [0.9, 0.5], [0.4, 0.3], [0.9, 0.8]
         ], device=get_accelerator().current_device())
-        assert not torch.equal(expected1, topk_weight), f"Expected {expected1}, but got {topk_weight}"
+        assert torch.equal(expected1, topk_weight), f"Expected {expected1}, but got {topk_weight}"

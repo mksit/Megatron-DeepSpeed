@@ -1,20 +1,23 @@
 import deepspeed
 import torch
 import types
+import pytest
+import sys
+import os
 
 from megatron.model.deepseek.layers import MoELayer, DeepSeekMoE
 from megatron.model.deepseek.token_dispatcher import MoEAlltoAllTokenDispatcher
-from megatron.model.deepseek.transformer_config import DeepSeekTransformerConfig
+from megatron.model.deepseek.transformer_config import DeepSeekTransformerConfig, deepseek_config_from_args
 from megatron import print_rank_0
-from megatron.global_vars import set_args
-from megatron.model.deepseek.tests.common import DistributedTest
+from megatron.global_vars import set_args, get_args
+from megatron.model.deepseek.tests.common import DistributedTest, get_test_path
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core import parallel_state
+from megatron.core.enums import ModelType
 
 from deepspeed.utils import groups
 from deepspeed.accelerator import get_accelerator
 from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer, is_moe_param
-
 
 def initialize_megatron_states(args):
     set_args(args)
@@ -30,34 +33,34 @@ def initialize_expert_parallel(ep_size: int):
     ep_group = groups._get_expert_parallel_group(expert_group_name)
     return ep_group
 
+megatron_args = {
+    "num_layers": 2,
+    "hidden_size": 16,
+    "ffn_hidden_size": 32,
+    "num_routed_experts": 4,
+    "num_shared_experts": 2,
+    "moe_router_topk": 2,
+    "expert_model_parallel_size": 2,
+    "num_attention_heads": 16,
+    "openai_gelu": False,
+    "onnx_safe": False,
+    "swiglu": True,
+    "bias_gelu_fusion": False,
+    "transformer_impl": "",
+    "fp8_interval": False,
+    "tensor_model_parallel_size": 1,
+    "no_persist_layer_norm": False,
+    "apply_layernorm_1p": False,
+    "overlap_p2p_comm": False,
+    "init_method_xavier_uniform": True,
+}
 
-megatron_args = types.SimpleNamespace(
-    openai_gelu=False,
-    onnx_safe=False,
-    swiglu=True,
-    bias_gelu_fusion=False,
-    transformer_impl="",
-    cache_fp8_weight=False,
-    fp8_interval=False,
-    cache_fp8_weight_fwd=False,
-    tensor_model_parallel_size=1,
-)
-
+os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
 def initialize_moe_model():
     initialize_megatron_states(megatron_args)
 
-    config = DeepSeekTransformerConfig(
-        num_attention_heads=4,
-        hidden_size=16,
-        ffn_hidden_size=32,
-        add_bias_linear=False,
-        num_layers=2,
-        num_routed_experts=4,
-        num_shared_experts=2,
-        moe_router_topk=2,
-        expert_model_parallel_size=2,
-    )
+    config = deepseek_config_from_args(megatron_args)
     moe_model = DeepSeekMoE(config)
     moe_model.to(get_accelerator().current_device())
     moe_model.set_deepspeed_parallelism()
@@ -209,14 +212,15 @@ class TestDeepSeekMoE(DistributedTest):
 
         assert moe_model.num_local_routed_experts == 2, f"Expected 2 local routed experts, but got {moe_model.num_local_routed_experts}"
 
-    def test_forward_shapes(self):
+    def test_forward(self):
         moe_model = initialize_moe_model()
 
         batch_size = 16
         seq_len = 4
 
         # [seq_len, batch size, hidden size]
-        hidden_states = torch.ones(seq_len, batch_size, moe_model.config.hidden_size, 
+        hidden_states = torch.ones(seq_len, batch_size, moe_model.config.hidden_size,
+                                   dtype=torch.float16, 
                                    device=get_accelerator().current_device())
 
         output = moe_model(hidden_states)
@@ -246,3 +250,85 @@ class TestDeepSeekMoE(DistributedTest):
             [0.9, 0.3], [0.9, 0.5], [0.4, 0.3], [0.9, 0.8]
         ], device=get_accelerator().current_device())
         assert torch.equal(expected1, topk_weight), f"Expected {expected1}, but got {topk_weight}"
+
+
+def get_deepseekv2_model(args_others, mp_size=1):
+    from megatron.model.deepseek.deepseek_model import DeepSeekV2Model
+    from megatron.initialize import initialize_megatron
+    from megatron.model.deepseek.transformer_config import add_deepseek_arguments
+
+    args_defaults = {
+        'vocab_file': get_test_path('gpt2-vocab.json'),
+        'merge_file': get_test_path('gpt2-merges.txt'),
+        'tokenizer_type': 'GPT2BPETokenizer',
+    }
+
+    args_defaults.update(args_others)
+    args_defaults['tensor_model_parallel_size'] = mp_size
+
+    args_defaults.update(megatron_args)
+
+    # setting "make-vocab-size-divisible-by" to avoid word-embedding size change in resizing testing.
+    sys.argv.extend(['--make-vocab-size-divisible-by', str(1)])
+
+    initialize_megatron(args_defaults=args_defaults, ignore_unknown_args=True, extra_args_provider=add_deepseek_arguments)
+    args = get_args()
+    args.model_type = ModelType.encoder_or_decoder
+
+    config = deepseek_config_from_args(args)
+    model = DeepSeekV2Model(config=config, num_tokentypes=0, parallel_output=False)
+    model.to(get_accelerator().device_name())
+    from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+    from megatron.core import mpu
+    i = get_accelerator().current_device_name()
+    model = torchDDP(model, device_ids=[i], output_device=i, process_group=mpu.get_data_parallel_group())
+
+    return model
+
+
+def get_deepspeed_model(model):
+    ds_config_dict = {
+        "train_micro_batch_size_per_gpu": 1,
+        "optimizer": {
+            "type": "Lamb",
+            "params": {
+                "lr": 0.00015
+            }
+        },
+    }
+
+    from megatron.core import mpu
+    model, _, _, _ = deepspeed.initialize(model=model,
+                                          mpu=mpu,
+                                          model_parameters=model.parameters(),
+                                          config=ds_config_dict)
+    return model
+
+
+class TestDeepSeekV2Model(DistributedTest):
+    world_size = 2
+
+    @pytest.fixture
+    def inputs(self, bs=1, seq_len=20):
+        input_ids = torch.randint(low=0, high=1000, size=(bs, seq_len))
+        position_ids = torch.randint(low=0, high=2, size=(bs, seq_len))
+        attention_mask = torch.randint(low=0, high=2, size=(bs, seq_len), dtype=torch.bool)
+        return [input_ids, position_ids, attention_mask]
+
+    def test_forward(self, inputs):
+        args_defaults = {
+            "micro_batch_size": 1,
+            "max_position_embeddings": 128,
+            "seq_length": 128,
+        }
+        model = get_deepseekv2_model(args_defaults, mp_size=2)
+        model = get_deepspeed_model(model)
+
+        device_name = get_accelerator().device_name()
+        input_ids, position_ids, attention_mask = inputs[0].to(device_name), inputs[1].to(device_name), inputs[2].to(device_name)
+        outputs = model(input_ids, position_ids, attention_mask)
+
+        args = get_args()
+        expected_shape = (*inputs[0].shape, args.padded_vocab_size)
+
+        assert expected_shape == outputs[0].shape, f"Expected {expected_shape}, but got {outputs[0].shape}"

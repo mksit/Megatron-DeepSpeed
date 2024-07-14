@@ -1,2 +1,2 @@
 from .layers import DeepSeekMoE
-from .transformer_config import DeepSeekTransformerConfig
+from .transformer_config import DeepSeekTransformerConfig, deepseek_config_from_args

@@ -5,7 +5,7 @@ import pytest
 import sys
 import os
 
-from megatron.model.deepseek.layers import MoELayer, DeepSeekMoE
+from megatron.model.deepseek.layers import MoELayer, DeepSeekMoE, MultiHeadLatentAttention
 from megatron.model.deepseek.token_dispatcher import MoEAlltoAllTokenDispatcher
 from megatron.model.deepseek.transformer_config import DeepSeekTransformerConfig, deepseek_config_from_args
 from megatron import print_rank_0
@@ -18,6 +18,35 @@ from megatron.core.enums import ModelType
 from deepspeed.utils import groups
 from deepspeed.accelerator import get_accelerator
 from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer, is_moe_param
+
+
+def initialize_args(args_others = {}, mp_size=1):
+    from megatron.initialize import initialize_megatron
+    from megatron.model.deepseek.transformer_config import add_deepseek_arguments
+
+    external_args = {
+        "micro_batch_size": 1,
+        "max_position_embeddings": 128,
+        "seq_length": 128,
+        'vocab_file': get_test_path('gpt2-vocab.json'),
+        'merge_file': get_test_path('gpt2-merges.txt'),
+        'tokenizer_type': 'GPT2BPETokenizer',
+    }
+
+    external_args.update(megatron_args)
+
+    external_args.update(args_others)
+    external_args['tensor_model_parallel_size'] = mp_size
+
+    # setting "make-vocab-size-divisible-by" to avoid word-embedding size change in resizing testing.
+    sys.argv.extend(['--make-vocab-size-divisible-by', str(1)])
+
+    initialize_megatron(external_args=external_args, ignore_unknown_args=True, extra_args_provider=add_deepseek_arguments)
+    args = get_args()
+    args.model_type = ModelType.encoder_or_decoder
+
+    return args
+
 
 def initialize_megatron_states(args):
     set_args(args)
@@ -33,6 +62,7 @@ def initialize_expert_parallel(ep_size: int):
     ep_group = groups._get_expert_parallel_group(expert_group_name)
     return ep_group
 
+
 megatron_args = {
     "num_layers": 2,
     "hidden_size": 16,
@@ -41,7 +71,7 @@ megatron_args = {
     "num_shared_experts": 2,
     "moe_router_topk": 2,
     "expert_model_parallel_size": 2,
-    "num_attention_heads": 16,
+    "num_attention_heads": 8,
     "openai_gelu": False,
     "onnx_safe": False,
     "swiglu": True,
@@ -57,10 +87,12 @@ megatron_args = {
 
 os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
-def initialize_moe_model():
-    initialize_megatron_states(megatron_args)
+def get_deepseek_moe_model():
+    args = types.SimpleNamespace(**megatron_args)
+    args.params_dtype = torch.float32
+    initialize_megatron_states(args)
 
-    config = deepseek_config_from_args(megatron_args)
+    config = deepseek_config_from_args(args)
     moe_model = DeepSeekMoE(config)
     moe_model.to(get_accelerator().current_device())
     moe_model.set_deepspeed_parallelism()
@@ -189,7 +221,9 @@ class TestDeepSeekMoE(DistributedTest):
     world_size = 2
 
     def test_constructor(self):
-        initialize_megatron_states(megatron_args)
+        args = types.SimpleNamespace(**megatron_args)
+        args.params_dtype = torch.float32
+        initialize_megatron_states(args)
 
         config = DeepSeekTransformerConfig(
             num_attention_heads=4,
@@ -213,22 +247,22 @@ class TestDeepSeekMoE(DistributedTest):
         assert moe_model.num_local_routed_experts == 2, f"Expected 2 local routed experts, but got {moe_model.num_local_routed_experts}"
 
     def test_forward(self):
-        moe_model = initialize_moe_model()
+        moe_model = get_deepseek_moe_model()
 
         batch_size = 16
         seq_len = 4
 
         # [seq_len, batch size, hidden size]
         hidden_states = torch.ones(seq_len, batch_size, moe_model.config.hidden_size,
-                                   dtype=torch.float16, 
+                                   dtype=torch.float32, 
                                    device=get_accelerator().current_device())
 
         output = moe_model(hidden_states)
 
-        assert output.shape == hidden_states.shape, f"Expected {hidden_states.shape}, but got {output.shape}"
+        assert output[0].shape == hidden_states.shape, f"Expected {hidden_states.shape}, but got {output[0].shape}"
 
     def test_topk_gating(self):
-        moe_model = initialize_moe_model()
+        moe_model = get_deepseek_moe_model()
 
         hidden_shape = (2, 2, 16)
 
@@ -250,6 +284,58 @@ class TestDeepSeekMoE(DistributedTest):
             [0.9, 0.3], [0.9, 0.5], [0.4, 0.3], [0.9, 0.8]
         ], device=get_accelerator().current_device())
         assert torch.equal(expected1, topk_weight), f"Expected {expected1}, but got {topk_weight}"
+
+
+class TestMultiLatentAttention(DistributedTest):
+    world_size = 2
+
+    @pytest.fixture
+    def inputs(self, bs=4, seq_len=64, h=16):
+        hidden_state = torch.randint(low=0, high=1000, size=(seq_len, bs, h), dtype=torch.float32)
+        position_ids = torch.randint(low=0, high=2, size=(bs, seq_len))
+        attention_mask = torch.randint(low=0, high=2, size=(bs, 1, seq_len, seq_len), dtype=torch.bool)
+        return [hidden_state, position_ids, attention_mask]
+
+    def test_basic(self, inputs):
+        args_others = {
+            "micro_batch_size": 4,
+            "seq_length": 64,
+        }
+        device_name = get_accelerator().device_name()
+
+        args = initialize_args(args_others)
+        config = deepseek_config_from_args(args)
+        self_attn = MultiHeadLatentAttention(config=config, layer_idx=0).to(device_name)
+
+        hidden_state, position_ids, attention_mask = inputs[0].to(device_name), inputs[1].to(device_name), inputs[2].to(device_name)
+        output, _ = self_attn(
+            hidden_states=hidden_state,
+            position_ids=position_ids,
+            attention_mask=attention_mask)
+
+        assert output.shape == hidden_state.shape, f"Expected {hidden_state.shape}, but got {output.shape}"
+
+    def test_tp(self, inputs):
+        args_others = {
+            "micro_batch_size": 4,
+            "seq_length": 64,
+        }
+        device_name = get_accelerator().device_name()
+
+        args = initialize_args(args_others, mp_size=2)
+        config = deepseek_config_from_args(args)
+        self_attn = MultiHeadLatentAttention(config=config, layer_idx=0).to(device_name)
+
+        hidden_state, position_ids, attention_mask = inputs[0].to(device_name), inputs[1].to(device_name), inputs[2].to(device_name)
+        output, _ = self_attn(
+            hidden_states=hidden_state,
+            position_ids=position_ids,
+            attention_mask=attention_mask)
+
+        assert output.shape == hidden_state.shape, f"Expected {hidden_state.shape}, but got {output.shape}"
+        assert self_attn.world_size == 2, f"Expected 2, but got {self_attn.world_size}"
+        assert self_attn.num_attention_heads_per_partition == 4, f"Expected 4, but got {self_attn.num_attention_heads_per_partition}"
+        assert self_attn.q_lora_rank_per_partition == 768, f"Expected 768, but got {self_attn.q_lora_rank_per_partition}"
 
 
 def get_deepseekv2_model(args_others, mp_size=1):
@@ -312,7 +398,7 @@ class TestDeepSeekV2Model(DistributedTest):
     def inputs(self, bs=1, seq_len=20):
         input_ids = torch.randint(low=0, high=1000, size=(bs, seq_len))
         position_ids = torch.randint(low=0, high=2, size=(bs, seq_len))
-        attention_mask = torch.randint(low=0, high=2, size=(bs, seq_len), dtype=torch.bool)
+        attention_mask = torch.randint(low=0, high=2, size=(bs, 1, seq_len, seq_len), dtype=torch.bool)
         return [input_ids, position_ids, attention_mask]
 
     def test_forward(self, inputs):
@@ -337,3 +423,6 @@ class TestDeepSeekV2Model(DistributedTest):
 
         moe_module = model.module.module.language_model.encoder.layers[1].mlp
         assert isinstance(moe_module, DeepSeekMoE), f"Expected DeepSeekMoE, but got {type(moe_module)}"
+
+        self_attn = model.module.module.language_model.encoder.layers[1].self_attention
+        assert  isinstance(self_attn, MultiHeadLatentAttention), f"Expected MultiLatentAttention, but got {type(self_attn)}"

@@ -1,5 +1,7 @@
-from typing import Tuple, TYPE_CHECKING
+from typing import Tuple, TYPE_CHECKING, Optional, Any
 import math
+import warnings
+import logging
 
 import numpy as np
 
@@ -15,14 +17,14 @@ from deepspeed.utils.timer import SynchronizedWallClockTimer
 
 from megatron.global_vars import get_args
 from megatron.model.module import MegatronModule 
-from megatron.core import parallel_state, tensor_parallel, mpu
+from megatron.core import parallel_state, tensor_parallel, mpu, utils
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 from megatron.model.fused_bias_gelu import bias_gelu_impl
+from megatron.model.rmsnorm import RMSNorm
 
-from .transformer_config import DeepSeekTransformerConfig
 from .transformer_config import DeepSeekTransformerConfig
 from .token_dispatcher import MoEAlltoAllTokenDispatcher
-
+from .rotary_embedding import apply_rotary_pos_emb, DeepseekV2RotaryEmbedding, DeepseekV2LinearScalingRotaryEmbedding, DeepseekV2DynamicNTKScalingRotaryEmbedding, DeepseekV2YarnRotaryEmbedding, yarn_get_mscale
 
 MOE_TIMER = 'moe'
 TOPK_GATE_TIMER = 'topk_gate'
@@ -442,3 +444,272 @@ class DeepSeekMoE(nn.Module):
         if self.config.num_shared_experts is not None:
             y = y + self.shared_experts(identity)[0]
         return y, self.moe.l_aux, self.moe.num_tokens_per_expert
+
+
+DeepseekV2RMSNorm = RMSNorm
+
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, config: DeepSeekTransformerConfig, layer_idx: Optional[int] = None):
+        super().__init__()
+        args = get_args()
+
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logging.getLogger(__name__).warning(
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.q_lora_rank = config.q_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
+        self.is_causal = True
+
+        # Per attention head and per partition values.
+        self.world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.num_attention_heads_per_partition = utils.divide(
+            config.num_attention_heads, self.world_size)
+        self.q_lora_rank_per_partition = utils.divide(
+            config.q_lora_rank, self.world_size)
+
+        # W^DQ:
+        # [hidden_size, q_lora_rank]
+        self.q_a_proj = tensor_parallel.ColumnParallelLinear(
+            self.hidden_size,
+            config.q_lora_rank,
+            bias=config.add_bias_linear,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False
+        )
+        self.q_a_layernorm = DeepseekV2RMSNorm(self.q_lora_rank_per_partition)
+        # W^UQ and W^QR: [q_lora_rank, num_heads * q_head_dim]
+        # = [q_lora_rank, num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)]
+        self.q_b_proj = tensor_parallel.ColumnParallelLinear(
+            self.q_lora_rank_per_partition,
+            self.num_heads * self.q_head_dim,
+            bias=False,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False
+        )
+
+        # W^{DKV} and W^{KR}: [hidden_size, kv_lora_rank + qk_rope_head_dim]
+        self.kv_a_proj_with_mqa = tensor_parallel.ColumnParallelLinear(
+            self.hidden_size,
+            (config.kv_lora_rank + config.qk_rope_head_dim) * self.world_size,
+            bias=config.add_bias_linear,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False
+        )
+        self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank)
+        # W^{UK} and W^{UV}: [kv_lora_rank, num_heads * (q_head_dim - qk_rope_head_dim + v_head_dim)]
+        self.kv_b_proj = tensor_parallel.ColumnParallelLinear(
+            config.kv_lora_rank,
+            self.num_heads
+            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
+            bias=False,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False
+        )
+
+        self.o_proj = tensor_parallel.RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=config.add_bias_linear,
+            config=config,
+            init_method=config.init_method,
+            input_is_parallel=True,
+            skip_bias_add=True
+        )
+        self._init_rope()
+
+        self.softmax_scale = self.q_head_dim ** (-0.5)
+        if self.config.rotary_scaling_factor is not None:
+            mscale_all_dim = self.config.mscale_all_dim
+            scaling_factor = self.config.rotary_scaling_factor
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.softmax_scale = self.softmax_scale * mscale * mscale
+
+    def _init_rope(self):
+        if self.config.rotary_scaling_factor is None:
+            self.rotary_emb = DeepseekV2RotaryEmbedding(
+                self.qk_rope_head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+        else:
+            self.rotary_emb = DeepseekV2YarnRotaryEmbedding(
+                self.qk_rope_head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                scaling_factor=self.config.rotary_scaling_factor,
+                base=self.rope_theta,
+            )
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.v_head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inference_params: Optional[Any] = None,
+        rotary_pos_emb: Optional[Any] = None,
+        past_key_value: Optional[Any] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+        assert rotary_pos_emb is None, "External rotary position embedding is not supported in this layer."
+        # [seq_len, batch_size, hidden_size]
+        q_len, bsz, _ = hidden_states.size()
+
+        # q: [seq_len, batch_size, q_lora_rank]
+        # = [seq_len, batch_size, hidden_size] * [hidden_size, q_lora_rank]
+        q, _ = self.q_a_proj(hidden_states)
+        # q: [seq_len, batch_size, hidden_size, num_heads * q_head_dim]
+        #  =  [seq_len, batch_size, q_lora_rank] * [q_lora_rank, num_heads * q_head_dim]
+        q, _ = self.q_b_proj(self.q_a_layernorm(q))
+        # Reshape for RoPE
+        # q: [seq_len, batch_size, hidden_size, num_heads * q_head_dim] 
+        # -> [batch_size, num_heads, seq_len, q_head_dim]
+        # where q_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        q = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim).permute(1, 2, 0, 3)
+        # q_nope: [batch_size, num_heads, seq_len, qk_nope_head_dim]
+        # q_pe = [batch_size, num_heads, seq_len, qk_rope_head_dim]
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
+        # compressed_kv: [seq_len, batch_size, kv_lora_rank + qk_rope_head_dim]
+        # = [seq_len, batch_size, hidden_size] * [hidden_size, kv_lora_rank + qk_rope_head_dim]
+        compressed_kv, _ = self.kv_a_proj_with_mqa(hidden_states)
+        # compressed_kv: [seq_len, batch_size, kv_lora_rank]
+        # k_pe: [seq_len, batch_size, qk_rope_head_dim]
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        # Reshape for RoPE
+        # k_pe: [seq_len, batch_size, qk_rope_head_dim] -> [batch_size, 1, seq_len, qk_rope_head_dim]
+        k_pe = k_pe.view(q_len, bsz, 1, self.qk_rope_head_dim).permute(1, 2, 0, 3)
+        # Extend MLA to MHA forms
+        # kv: [seq_len, batch_size, num_heads * (q_head_dim - qk_rope_head_dim + v_head_dim)]
+        # = [seq_len, batch_size, kv_lora_rank] * [kv_lora_rank, num_heads * (q_head_dim - qk_rope_head_dim + v_head_dim)]
+        kv, _ = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
+        # kv: [batch_size, num_heads, seq_len, qk_nope_head_dim + v_head_dim]
+        kv = (
+            kv.view(q_len, bsz, self.num_attention_heads_per_partition, self.qk_nope_head_dim + self.v_head_dim)
+            .permute(1, 2, 0, 3) # [seq_len, batch_size, num_heads, qk_nope_head_dim + v_head_dim] -> [batch_size, num_heads, seq_len, qk_nope_head_dim + v_head_dim]
+        )
+
+        # k_nope: [batch_size, num_heads, seq_len, qk_nope_head_dim]
+        # value_states: [batch_size, num_heads, seq_len, v_head_dim]
+        k_nope, value_states = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        # kv_seq_len = seq_len
+        kv_seq_len = value_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        # q_pe: [batch_size, num_heads, seq_len, qk_rope_head_dim]
+        # k_pe: [batch_size, 1, seq_len, qk_rope_head_dim]
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+        # key_states: [batch_size, num_heads, seq_len, q_head_dim]
+        query_states = k_pe.new_empty(bsz, self.num_attention_heads_per_partition, q_len, self.q_head_dim)
+        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+        # key_states: [batch_size, num_heads, seq_len, q_head_dim]
+        key_states = k_pe.new_empty(bsz, self.num_attention_heads_per_partition, q_len, self.q_head_dim)
+        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        # MHA computation
+        # query_states: [batch_size, num_heads, seq_len, q_head_dim]
+        # key_states: [batch_size, num_heads, seq_len, q_head_dim]
+        # value_states: [batch_size, num_heads, seq_len, v_head_dim]
+
+        # attn_weights: [batch_size, num_heads, seq_len, seq_len] =
+        # [batch_size, num_heads, seq_len, q_head_dim] * [batch_size, num_heads, q_head_dim, seq_len]
+        attn_weights = (
+            torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
+        )
+
+        if attn_weights.size() != (bsz, self.num_attention_heads_per_partition, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_attention_heads_per_partition, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+        assert attention_mask is not None
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
+        # Upcast attention to fp32
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
+        )
+        # attn_output: [batch_size, num_heads, seq_len, v_head_dim]
+        # = [batch_size, num_heads, seq_len, seq_len] * [batch_size, num_heads, seq_len, v_head_dim]
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_attention_heads_per_partition, q_len, self.v_head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_attention_heads_per_partition, q_len, self.v_head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        # [seq_len, batch_size, num_heads, v_head_dim]
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous()
+
+        # [seq_len, batch_size, num_heads * v_head_dim]
+        attn_output = attn_output.reshape(q_len, bsz, self.num_attention_heads_per_partition * self.v_head_dim)
+
+        # [seq_len, batch_size, hidden_size] =
+        # [seq_len, batch_size, num_heads * v_head_dim] * [num_heads * v_head_dim, hidden_size]
+        attn_output, output_bias = self.o_proj(attn_output)
+
+        return attn_output, output_bias

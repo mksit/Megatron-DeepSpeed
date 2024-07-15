@@ -50,6 +50,25 @@ class DeepSeekTransformerConfig(TransformerConfig):
 
     # DeepSeek use SwigGLU by default
     swiglu: bool = True
+    
+    # The base period of the RoPE embeddings.
+    rope_theta: float = 10000.0
+
+    q_lora_rank: int = 1536
+
+    qk_rope_head_dim: int = 64
+
+    kv_lora_rank: int = 512
+
+    v_head_dim: int = 128
+
+    qk_nope_head_dim: int = 128
+
+    mscale_all_dim: int = 128
+
+    rotary_scaling_factor: float = 1.0
+
+    max_position_embeddings: int = None
 
     def __post_init__(self):
         super().__post_init__()

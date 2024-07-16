@@ -286,7 +286,7 @@ class TestDeepSeekMoE(DistributedTest):
         assert torch.equal(expected1, topk_weight), f"Expected {expected1}, but got {topk_weight}"
 
 
-class TestMultiLatentAttention(DistributedTest):
+class TestMultiHeadLatentAttention(DistributedTest):
     world_size = 2
 
     @pytest.fixture

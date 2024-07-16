@@ -551,6 +551,7 @@ class TransformerLanguageModel(MegatronModule):
             if self.encoder is not None:
                 encoder_output, *encoder_moe_losses = self.encoder(
                     encoder_input,
+                    enc_position_ids,
                     enc_attn_mask,
                     retriever_input=retriever_input,
                     retriever_attn_mask=retriever_attn_mask,
@@ -585,6 +586,7 @@ class TransformerLanguageModel(MegatronModule):
         # Run decoder.
         decoder_output, *decoder_moe_losses = self.decoder(
             decoder_input,
+            dec_position_ids,
             dec_attn_mask,
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,

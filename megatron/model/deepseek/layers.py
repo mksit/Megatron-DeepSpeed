@@ -263,7 +263,7 @@ class Experts(Module):
         self.local_experts = torch.nn.ModuleList()
         for _ in range(num_local_experts):
             self.local_experts.append(ParallelMLP(
-                config, config.ffn_hidden_size, moe=True, enable_expert_tensor_parallelism=enable_expert_tensor_parallelism))
+                config, config.moe_ffn_hidden_size, moe=True, enable_expert_tensor_parallelism=enable_expert_tensor_parallelism))
 
     def forward(self, permuted_hidden_states: Tensor, num_tokens_per_expert: int) -> Tuple[Tensor, Tensor]:
         """
@@ -415,8 +415,8 @@ class DeepSeekMoE(nn.Module):
 
         if config.num_shared_experts is not None:
             self.shared_experts = ParallelMLP(config,
-                                    config.ffn_hidden_size * config.num_shared_experts,
-                                    moe=False,
+                                    config.moe_ffn_hidden_size * config.num_shared_experts,
+                                    moe=True,
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
 
     def set_deepspeed_parallelism(self, use_data_before_expert_parallel_: bool = False) -> None:
@@ -482,30 +482,41 @@ class MultiHeadLatentAttention(nn.Module):
         self.world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.num_attention_heads_per_partition = utils.divide(
             config.num_attention_heads, self.world_size)
-        self.q_lora_rank_per_partition = utils.divide(
-            config.q_lora_rank, self.world_size)
 
-        # W^DQ:
-        # [hidden_size, q_lora_rank]
-        self.q_a_proj = tensor_parallel.ColumnParallelLinear(
-            self.hidden_size,
-            config.q_lora_rank,
-            bias=config.add_bias_linear,
-            config=config,
-            init_method=config.init_method,
-            gather_output=False
-        )
-        self.q_a_layernorm = DeepseekV2RMSNorm(self.q_lora_rank_per_partition)
-        # W^UQ and W^QR: [q_lora_rank, num_heads * q_head_dim]
-        # = [q_lora_rank, num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)]
-        self.q_b_proj = tensor_parallel.ColumnParallelLinear(
-            self.q_lora_rank_per_partition,
-            self.num_heads * self.q_head_dim,
-            bias=False,
-            config=config,
-            init_method=config.init_method,
-            gather_output=False
-        )
+        if self.config.q_lora_rank is None:
+            # W^Q: [hidden_size, num_heads * q_head_dim]
+            self.q_proj = tensor_parallel.ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * self.q_head_dim,
+                bias=config.add_bias_linear,
+                config=config,
+                init_method=config.init_method,
+                gather_output=False
+            )
+        else:
+            self.q_lora_rank_per_partition = utils.divide(
+                config.q_lora_rank, self.world_size)
+            # W^DQ:
+            # [hidden_size, q_lora_rank]
+            self.q_a_proj = tensor_parallel.ColumnParallelLinear(
+                self.hidden_size,
+                config.q_lora_rank,
+                bias=config.add_bias_linear,
+                config=config,
+                init_method=config.init_method,
+                gather_output=False
+            )
+            self.q_a_layernorm = DeepseekV2RMSNorm(self.q_lora_rank_per_partition)
+            # W^UQ and W^QR: [q_lora_rank, num_heads * q_head_dim]
+            # = [q_lora_rank, num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)]
+            self.q_b_proj = tensor_parallel.ColumnParallelLinear(
+                self.q_lora_rank_per_partition,
+                self.num_heads * self.q_head_dim,
+                bias=False,
+                config=config,
+                init_method=config.init_method,
+                gather_output=False
+            )
 
         # W^{DKV} and W^{KR}: [hidden_size, kv_lora_rank + qk_rope_head_dim]
         self.kv_a_proj_with_mqa = tensor_parallel.ColumnParallelLinear(
@@ -587,12 +598,16 @@ class MultiHeadLatentAttention(nn.Module):
         # [seq_len, batch_size, hidden_size]
         q_len, bsz, _ = hidden_states.size()
 
-        # q: [seq_len, batch_size, q_lora_rank]
-        # = [seq_len, batch_size, hidden_size] * [hidden_size, q_lora_rank]
-        q, _ = self.q_a_proj(hidden_states)
-        # q: [seq_len, batch_size, hidden_size, num_heads * q_head_dim]
-        #  =  [seq_len, batch_size, q_lora_rank] * [q_lora_rank, num_heads * q_head_dim]
-        q, _ = self.q_b_proj(self.q_a_layernorm(q))
+        if self.config.q_lora_rank is None:
+            q, _ = self.q_proj(hidden_states)
+        else:
+            # q: [seq_len, batch_size, q_lora_rank]
+            # = [seq_len, batch_size, hidden_size] * [hidden_size, q_lora_rank]
+            q, _ = self.q_a_proj(hidden_states)
+            # q: [seq_len, batch_size, hidden_size, num_heads * q_head_dim]
+            #  =  [seq_len, batch_size, q_lora_rank] * [q_lora_rank, num_heads * q_head_dim]
+            q, _ = self.q_b_proj(self.q_a_layernorm(q))
+
         # Reshape for RoPE
         # q: [seq_len, batch_size, hidden_size, num_heads * q_head_dim] 
         # -> [batch_size, num_heads, seq_len, q_head_dim]

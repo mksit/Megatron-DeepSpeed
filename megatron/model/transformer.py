@@ -977,7 +977,8 @@ class ParallelTransformerLayer(MegatronModule):
         # MLP
         self.num_experts = num_experts
         if isinstance(config, DeepSeekTransformerConfig): # DeepSeek
-            if self.num_experts <= 1: # dense, not MoE
+            # First layer of DeepSeek is always a dense layer
+            if self.num_experts <= 1 or self.layer_number == 1: # dense, not MoE
                 self.mlp = ParallelMLP(config)
             else: # DeepSeek's MoE
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism

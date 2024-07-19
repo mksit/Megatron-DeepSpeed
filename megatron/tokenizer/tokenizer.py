@@ -543,7 +543,7 @@ class _HFTokenizer(AbstractTokenizer):
     def __init__(self, tokenizer_name_or_path,max_seq_len):
         name = tokenizer_name_or_path
         super().__init__(name)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path,padding_side="right",use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path,padding_side="right",use_fast=False,trust_remote_code=True)
         
         DEFAULT_PAD_TOKEN = "[PAD]"
         DEFAULT_EOS_TOKEN = "</s>"

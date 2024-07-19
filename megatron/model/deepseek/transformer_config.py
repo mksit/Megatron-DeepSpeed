@@ -27,6 +27,9 @@ class DeepSeekTransformerConfig(TransformerConfig):
     # Capacity factor for each expert (should be always None)
     moe_expert_capacity_factor: int = None
 
+    # MoE Feed-Forward Network hidden size.
+    moe_ffn_hidden_size: int = None
+
     # Top-k method used in routed gate.
     topk_method: str = "greedy"
 
@@ -75,6 +78,8 @@ class DeepSeekTransformerConfig(TransformerConfig):
         if self.swiglu:
             self.gated_linear_unit = True
 
+        if self.moe_ffn_hidden_size is None:
+            self.moe_ffn_hidden_size = self.ffn_hidden_size
 
 def deepseek_config_from_args(args):
     # Translate args to core transformer configuration
@@ -99,10 +104,12 @@ def deepseek_config_from_args(args):
 
 
 def add_deepseek_arguments(parser):
-    group = parser.add_argument_group(title='distributed')
+    group = parser.add_argument_group(title='deepseek')
 
     group.add_argument('--expert-model-parallel-size', type=int, default=None,
                           help='Expert model parallel size.')
+    group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
+                          help='MoE Feed-Forward Network hidden size.')
     group.add_argument('--num-routed-experts', type=int, default=None,
                             help='Number of routed experts.')
     group.add_argument('--num-shared-experts', type=int, default=None,
@@ -127,4 +134,20 @@ def add_deepseek_arguments(parser):
                             help='Scaling factor or routed experts.')
     group.add_argument('--num-expert-groups', type=int, default=None,
                             help='Number of groups for routed experts.')
+    group.add_argument('--rope-theta', type=float, default=10000.0,
+                            help='The base period of the RoPE embeddings.')
+    group.add_argument('--kv-lora-rank', type=int, default=None,
+                            help='')
+    group.add_argument('--q-lora-rank', type=int, default=None,
+                            help='')
+    group.add_argument('--qk-rope-head-dim', type=int, default=None,
+                            help='')
+    group.add_argument('--v-head-dim', type=int, default=None,
+                            help='')
+    group.add_argument('--qk-nope-head-dim', type=int, default=None,
+                            help='')
+    group.add_argument('--mscale-all-dim', type=int, default=None,
+                            help='')
+    group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
+                            help='Rotary scaling factor.')
     return parser

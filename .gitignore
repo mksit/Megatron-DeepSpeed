@@ -21,3 +21,4 @@ logs
 
 # Data folder
 bookcorpus_data/
+finetune_deepseek/data/

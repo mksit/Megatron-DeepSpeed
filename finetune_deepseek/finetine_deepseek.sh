@@ -1,24 +1,44 @@
-DS_CONFIG=./examples_deepspeed/finetune_hf_llama/ds_config.json
-DATASET_PATH=./alpaca_data.json
+DS_CONFIG=./finetune_deepseek/ds_config.json
+DATASET_PATH=./finetune_deepseek/alpaca_data.json
 # dataset link: https://github.com/tatsu-lab/stanford_alpaca/blob/main/alpaca_data.json
 
-HF_LLAMA_PATH=./finetune_deepseek/DeepSeek-Coder-V2-Lite-Base
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+MODEL="deepseek-v2-lite"
+# MODEL="deepseek-coder-v2-lite-base"
+
+HF_LLAMA_PATH=./finetune_deepseek/data/$MODEL
 # weights link: https://huggingface.co/huggyllama/llama-7b
 
-MICRO_BATCH_SIZE=16
+MICRO_BATCH_SIZE=8
 GLOBAL_BATCH_SIZE=256
 TP=4
 EP=4
+ZERO_STAGE=2
+
+TRAIN_ITERS=200
 
 # require to align with weight dimensions
+
+# deepseek-v2-lite or deepseek-coder-v2-lite
 HIDDEN_SIZE=2048
 FFN_HIDDEN_SIZE=10944
 NUM_LAYERS=27
 NUM_HEADS=16
 SEQ_LENGTH=512
+MOE_FFN_HIDDEN_SIZE=1408
+MOE_ROUTED_EXPERTS=64
+MOE_SHARED_EXPERTS=2
+MOE_ROUTER_TOPK=6
+MOE_KV_LORA_RANK=512
+MOE_QK_NOPE_HEAD_DIM=128
+MOE_QK_ROPE_HEAD_DIM=64
+MOE_V_HEAD_DIM=128
+
 ######################################
 
-MEGA_DS_LLAMA_PATH=./finetune_deepseek/checkpoints/deepseek-coder-v2-lite-base-ds-tp${TP}-ep${EP}
+NAME="${MODEL}-mbs${MICRO_BATCH_SIZE}-z${ZERO_STAGE}-tp${TP}-ep${EP}"
+MEGA_DS_LLAMA_PATH=./finetune_deepseek/checkpoints/${NAME}
 
 cat <<EOT > $DS_CONFIG
 {
@@ -26,7 +46,7 @@ cat <<EOT > $DS_CONFIG
   "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
   "steps_per_print": 100,
   "zero_optimization": {
-    "stage": 0
+    "stage": ${ZERO_STAGE}
   },
   "bf16": {
     "enabled": true
@@ -34,29 +54,40 @@ cat <<EOT > $DS_CONFIG
 }
 EOT
 
+distributed_args="--num_gpus=4 --master_addr localhost --master_port 30000"
 
-covert_args="deepspeed --include localhost:4,5,6,7 --master_addr localhost --master_port 30000 finetune_deepseek/convert_hf_checkpoint.py \
+convert_args="deepspeed $distributed_args finetune_deepseek/convert_hf_checkpoint.py \
 --hf-ckpt-num-shards 4 \
 --input-dir $HF_LLAMA_PATH \
 --save $MEGA_DS_LLAMA_PATH"
 
-finetune_args="deepspeed finetune_llama.py \
---load $MEGA_DS_LLAMA_PATH"
+finetune_args="deepspeed $distributed_args pretrain_deepseek.py"
 
-moe_args="\
---moe-ffn-hidden-size 1408 \
---num-routed-experts 64 \
---num-shared-experts 2 \
---moe-router-topk 6 \
---expert-interval 1 \
---kv-lora-rank 512 \
---qk-nope-head-dim 128 \
---qk-rope-head-dim 64 \
---v-head-dim 128 \
+parallelism_args="\
+--tensor-model-parallel-size $TP \
 --expert-model-parallel-size $EP
 "
 
-comm_args="--tensor-model-parallel-size $TP \
+deepseek_args="\
+--moe-ffn-hidden-size $MOE_FFN_HIDDEN_SIZE \
+--num-routed-experts $MOE_ROUTED_EXPERTS \
+--num-shared-experts $MOE_SHARED_EXPERTS \
+--moe-router-topk $MOE_ROUTER_TOPK \
+--expert-interval 1 \
+--kv-lora-rank $MOE_KV_LORA_RANK \
+--qk-nope-head-dim $MOE_QK_NOPE_HEAD_DIM \
+--qk-rope-head-dim $MOE_QK_ROPE_HEAD_DIM \
+--v-head-dim $MOE_V_HEAD_DIM 
+"
+
+deepspeed_args="\
+--deepspeed \
+--deepspeed_config ./finetune_deepseek/ds_config.json \
+--no-pipeline-parallel \
+--deepspeed-activation-checkpointing
+"
+
+common_args="\
 --num-layers $NUM_LAYERS \
 --hidden-size $HIDDEN_SIZE \
 --num-attention-heads $NUM_HEADS \
@@ -76,7 +107,7 @@ comm_args="--tensor-model-parallel-size $TP \
 --max-position-embeddings 163840 \
 --micro-batch-size $MICRO_BATCH_SIZE \
 --global-batch-size $GLOBAL_BATCH_SIZE \
---train-iters 3500 \
+--train-iters $TRAIN_ITERS \
 --lr 2e-5 \
 --tensorboard-dir tensorboard_output \
 --lr-decay-iters 320000 \
@@ -88,11 +119,9 @@ comm_args="--tensor-model-parallel-size $TP \
 --save-interval 1500 \
 --split 100,0,0 \
 --bf16 \
---zero-stage 0 \
+--zero-stage ${ZERO_STAGE} \
 --tokenizer-type HFTokenizer \
 --tokenizer-model $HF_LLAMA_PATH \
---deepspeed_config ./finetune_deepseek/ds_config.json \
---deepspeed \
 --distributed-backend nccl \
 --num-workers 0 \
 --no-masked-softmax-fusion \
@@ -100,14 +129,23 @@ comm_args="--tensor-model-parallel-size $TP \
 --no-bias-dropout-fusion \
 --no-gradient-accumulation-fusion \
 --repeated-dataloader \
-$moe_args"
+--checkpoint-activations \
+$deepspeed_args \
+$deepseek_args \
+$parallelism_args"
+
+log_dir="./logs"
+mkdir -p $log_dir
 
 if [ "$1" = "convert" ]; then
-    task_args="$covert_args"
+    task_args="$convert_args"
+    log_file="$log_dir/convert_${NAME}.log"
 else
     task_args="$finetune_args"
+    log_file="$log_dir/finetune_${NAME}.log"
 fi
 
-full_cmd="$task_args $comm_args"
+full_cmd="$task_args $common_args &> $log_file"
 
-eval "$full_cmd"
+echo $full_cmd
+eval $full_cmd

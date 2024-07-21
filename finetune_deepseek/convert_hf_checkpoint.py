@@ -242,6 +242,9 @@ class refactor:
                 new_w = self._direct_refactor(pname, p)
             else: # transoformer layers
                 match = self.layer_pat.match(pname)
+                if match is None:
+                    raise ValueError(f"Unable to match parameter {pname}")
+                
                 layer_num = int(match.group(2))
                 subname = match.group(3)
                 hf_layer = layer_num - self.offset_num

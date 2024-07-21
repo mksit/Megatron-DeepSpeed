@@ -313,6 +313,9 @@ def validate_args(args, defaults={}):
     # to false to turn off absolute position embedding.
     if args.use_rotary_position_embeddings:
         args.add_position_embedding = False
+        # DeepSeek uses its own rotary positional embeddings
+        if hasattr(args, 'num_routed_experts'):
+            args.use_rotary_position_embeddings = False
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:

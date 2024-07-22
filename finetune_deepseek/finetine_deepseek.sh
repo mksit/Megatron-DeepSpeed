@@ -36,6 +36,17 @@ MOE_KV_LORA_RANK=512
 MOE_QK_NOPE_HEAD_DIM=128
 MOE_QK_ROPE_HEAD_DIM=64
 MOE_V_HEAD_DIM=128
+MOE_TOPK_GROUP=1
+MOE_AUX_LOSS_ALPHA=0.001
+MAX_POSITION_EMBEDDINGS=163840
+ROPE_BETA_FAST=32
+ROPE_BETA_SLOW=1
+ROPE_FACTOR=40
+ROPE_MSCALE=0.707
+ROPE_MSCALE_ALL_DIM=0.707
+ROPE_ORIG_MAX_POSITION_EMBEDDINGS=4096
+ROPE_THETA=10000
+ROUTED_SCALE_FACTOR=1.0
 
 ######################################
 
@@ -81,7 +92,19 @@ deepseek_args="\
 --qk-nope-head-dim $MOE_QK_NOPE_HEAD_DIM \
 --qk-rope-head-dim $MOE_QK_ROPE_HEAD_DIM \
 --v-head-dim $MOE_V_HEAD_DIM 
---create-moe-param-group
+--seq-aux \
+--create-moe-param-group \
+--aux-loss-alpha $MOE_AUX_LOSS_ALPHA \
+--rope-scaling-type 'yarn' \
+--rope-scaling-beta-fast $ROPE_BETA_FAST \
+--rope-scaling-beta-slow $ROPE_BETA_SLOW \
+--rope-scaling-factor $ROPE_FACTOR \
+--rope-scaling-mscale $ROPE_MSCALE \
+--rope-scaling-mscale-all-dim $ROPE_MSCALE_ALL_DIM \
+--rope-scaling-original-max-position-embeddings $ROPE_ORIG_MAX_POSITION_EMBEDDINGS \
+--rope-theta $ROPE_THETA \
+--routed-scaling-factor $ROUTED_SCALE_FACTOR \
+--topk-group $MOE_TOPK_GROUP \
 "
 
 deepspeed_args="\
@@ -108,7 +131,7 @@ common_args="\
 --weight-decay 0.1 \
 --clip-grad 1 \
 --seq-length $SEQ_LENGTH \
---max-position-embeddings 163840 \
+--max-position-embeddings $MAX_POSITION_EMBEDDINGS \
 --micro-batch-size $MICRO_BATCH_SIZE \
 --global-batch-size $GLOBAL_BATCH_SIZE \
 --train-iters $TRAIN_ITERS \
@@ -146,6 +169,9 @@ current_time=$(date "+%Y-%m-%d_%H-%M-%S")
 if [ "$1" = "convert" ]; then
     task_args="$convert_args"
     log_file="$log_dir/convert_${NAME}_${current_time}.log"
+elif [ "$1" = "test" ]; then
+    task_args="deepspeed $distributed_args pretrain_deepseek.py"
+    log_file="$log_dir/test_${NAME}_${current_time}.log"
 else
     task_args="$finetune_args"
     log_file="$log_dir/finetune_${NAME}_${current_time}.log"

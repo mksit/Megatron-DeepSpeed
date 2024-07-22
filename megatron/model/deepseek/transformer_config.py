@@ -67,11 +67,23 @@ class DeepSeekTransformerConfig(TransformerConfig):
 
     qk_nope_head_dim: int = 128
 
-    mscale_all_dim: int = 128
-
-    rotary_scaling_factor: float = 1.0
-
     max_position_embeddings: int = None
+
+    # RoPE scaling parameters
+
+    rope_scaling_type: str = None
+
+    rope_scaling_beta_fast: int = 32
+
+    rope_scaling_beta_slow: int = 1
+
+    rope_scaling_mscale: float = 0.707
+
+    rope_scaling_mscale_all_dim: float = 0.707
+
+    rope_scaling_factor: int = 40
+
+    rope_original_max_position_embeddings: int = 4096
 
     def __post_init__(self):
         super().__post_init__()
@@ -134,8 +146,6 @@ def add_deepseek_arguments(parser):
                             help='Scaling factor or routed experts.')
     group.add_argument('--num-expert-groups', type=int, default=None,
                             help='Number of groups for routed experts.')
-    group.add_argument('--rope-theta', type=float, default=10000.0,
-                            help='The base period of the RoPE embeddings.')
     group.add_argument('--kv-lora-rank', type=int, default=None,
                             help='')
     group.add_argument('--q-lora-rank', type=int, default=None,
@@ -146,8 +156,21 @@ def add_deepseek_arguments(parser):
                             help='')
     group.add_argument('--qk-nope-head-dim', type=int, default=None,
                             help='')
-    group.add_argument('--mscale-all-dim', type=int, default=None,
+    group.add_argument('--rope-theta', type=float, default=10000.0,
+                            help='The base period of the RoPE embeddings.')
+    group.add_argument('--rope-scaling-type', type=str, default=None,
                             help='')
-    group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
-                            help='Rotary scaling factor.')
+    group.add_argument('--rope-scaling-beta-fast', type=int, default=32,
+                            help='')
+    group.add_argument('--rope-scaling-beta-slow', type=int, default=1,
+                            help='')
+    group.add_argument('--rope-scaling-mscale', type=float, default=0.707,
+                            help='')
+    group.add_argument('--rope-scaling-mscale-all-dim', type=float, default=0.707,
+                            help='')
+    group.add_argument("--rope-scaling-original-max-position-embeddings", type=int, default=4096,
+                            help='')
+    group.add_argument('--rope-scaling-factor', type=float, default=1.0,
+                            help='')
+
     return parser

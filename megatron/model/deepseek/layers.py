@@ -422,8 +422,8 @@ class DeepSeekMoE(nn.Module):
                         num_local_experts=self.num_local_experts)
 
         if config.num_shared_experts is not None:
-            # NOTE: DeepSpeed will recognize routed experts by the word `expert` in the name, so
-            # changed the name to `shared_exp` to make DeepSpeed happy.
+            # DeepSpeed recognizes routed experts by the word `expert` in the name, so
+            # changed the name to `shared_exp` to handle the shared experts correctly.
             self.shared_exp = ParallelMLP(config,
                                     config.moe_ffn_hidden_size * config.num_shared_experts,
                                     moe=True,
@@ -516,7 +516,7 @@ class MultiHeadLatentAttention(nn.Module):
                 init_method=config.init_method,
                 gather_output=False
             )
-            self.q_a_layernorm = DeepseekV2RMSNorm(self.q_lora_rank_per_partition)
+            self.q_a_layernorm = DeepseekV2RMSNorm(self.q_lora_rank_per_partition, self.config.layernorm_epsilon)
             # W^UQ and W^QR: [q_lora_rank, num_heads * q_head_dim]
             # = [q_lora_rank, num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)]
             self.q_b_proj = tensor_parallel.ColumnParallelLinear(
@@ -537,7 +537,7 @@ class MultiHeadLatentAttention(nn.Module):
             init_method=config.init_method,
             gather_output=False
         )
-        self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank)
+        self.kv_a_layernorm = DeepseekV2RMSNorm(config.kv_lora_rank, self.config.layernorm_epsilon)
         # W^{UK} and W^{UV}: [kv_lora_rank, num_heads * (q_head_dim - qk_rope_head_dim + v_head_dim)]
         self.kv_b_proj = tensor_parallel.ColumnParallelLinear(
             config.kv_lora_rank,
@@ -561,26 +561,34 @@ class MultiHeadLatentAttention(nn.Module):
         self._init_rope()
 
         self.softmax_scale = self.q_head_dim ** (-0.5)
-        if self.config.rotary_scaling_factor is not None:
-            mscale_all_dim = self.config.mscale_all_dim
-            scaling_factor = self.config.rotary_scaling_factor
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.softmax_scale = self.softmax_scale * mscale * mscale
+        mscale_all_dim = self.config.rope_scaling_mscale_all_dim
+        scaling_factor = self.config.rope_scaling_factor
+        if mscale_all_dim:
+            mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+            self.softmax_scale = self.softmax_scale * mscale * mscale
 
     def _init_rope(self):
-        if self.config.rotary_scaling_factor is None:
+        if self.config.rope_scaling_type is None:
             self.rotary_emb = DeepseekV2RotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
             )
         else:
+            rope_kwargs = {
+                "original_max_position_embeddings": self.config.rope_original_max_position_embeddings,
+                "beta_fast": self.config.rope_scaling_beta_fast,
+                "beta_slow": self.config.rope_scaling_beta_slow,
+                "mscale": self.config.rope_scaling_mscale,
+                "mscale_all_dim": self.config.rope_scaling_mscale_all_dim,
+            }
+
             self.rotary_emb = DeepseekV2YarnRotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                scaling_factor=self.config.rotary_scaling_factor,
+                scaling_factor=self.config.rope_scaling_factor,
                 base=self.rope_theta,
+                **rope_kwargs
             )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):

@@ -244,7 +244,7 @@ class TestDeepSeekMoE(DistributedTest):
         experted0 = (16 * 32 * 2 + 32 * 16) * 2 + (16 * 64 * 2 + 16 * 64) + 16 * 4
         assert num_weights == experted0, f"Expected {experted0} parameters, but got {num_weights}"
 
-        assert moe_model.num_local_routed_experts == 2, f"Expected 2 local routed experts, but got {moe_model.num_local_routed_experts}"
+        assert moe_model.num_local_experts == 2, f"Expected 2 local routed experts, but got {moe_model.num_local_experts}"
 
     def test_forward(self):
         moe_model = get_deepseek_moe_model()

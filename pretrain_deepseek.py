@@ -20,6 +20,7 @@ from megatron.utils import average_losses_across_data_parallel_group, update_rot
 from megatron.arguments import core_transformer_config_from_args
 from megatron.model.deepseek.deepseek_model import DeepSeekV2Model
 from megatron.model.deepseek.transformer_config import deepseek_config_from_args, add_deepseek_arguments
+from megatron.model.deepseek.utils import init_deepseek_for_deepspeed
 from report_memory_usage import report_theoretical_memory_usage
 
 import deepspeed
@@ -38,8 +39,10 @@ import torch.distributed as dist
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
-    print_rank_0('building GPT model ...')
+    print_rank_0('Building DeepSeek model ...')
     see_memory_usage(f"Before Building Model", force=True)
+
+    init_deepseek_for_deepspeed()
 
     args = get_args()
     config = deepseek_config_from_args(args)

@@ -125,7 +125,7 @@ class refactor:
             hf_name = f"model.layers.{hf_layer}.self_attn.kv_a_proj_with_mqa.weight"
         elif subname in ["self_attention.kv_a_layernorm.weight"]:
             hf_name = f"model.layers.{hf_layer}.self_attn.kv_a_layernorm.weight"
-        elif subname in ["mlp.moe.gate.weight"]:
+        elif subname in ["mlp.deepspeed_moe.gate.weight"]:
             hf_name = f"model.layers.{hf_layer}.mlp.gate.weight"
         else:
             raise ValueError(f"Unrecognized weight type {subname}")
@@ -195,7 +195,7 @@ class refactor:
         return new_w
 
     def _moe_hto4h_refactor(self, pname, p, hf_layer, expert, subname):
-        if subname == "mlp.shared_experts.dense_h_to_4h.weight":
+        if subname == "mlp.shared_exp.dense_h_to_4h.weight":
             hf_w_gate_name = f"model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight"
             hf_w_up_name = f"model.layers.{hf_layer}.mlp.shared_experts.up_proj.weight"
         else:
@@ -216,7 +216,7 @@ class refactor:
         return new_w
 
     def _moe_4htoh_refactor(self, pname, p, hf_layer, expert, subname):
-        if subname == "mlp.shared_experts.dense_4h_to_h.weight":
+        if subname == "mlp.shared_exp.dense_4h_to_h.weight":
             hf_name = f"model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight"
         else:
             hf_name = f"model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight"
@@ -270,13 +270,13 @@ class refactor:
                 ]:
                     new_w = self._direct_refactor(pname, p, hf_layer, subname)
                 # MoE
-                elif subname in ["mlp.moe.gate.weight"]:
+                elif subname in ["mlp.deepspeed_moe.gate.weight"]:
                     new_w = self._direct_refactor(pname, p, hf_layer, subname)
-                elif subname in ["mlp.shared_experts.dense_h_to_4h.weight"]:
+                elif subname in ["mlp.shared_exp.dense_h_to_4h.weight"]:
                     new_w = self._moe_hto4h_refactor(pname, p, hf_layer, None, subname)
-                elif subname in ["mlp.shared_experts.dense_4h_to_h.weight"]:
+                elif subname in ["mlp.shared_exp.dense_4h_to_h.weight"]:
                     new_w = self._moe_4htoh_refactor(pname, p, hf_layer, None, subname)
-                elif subname.startswith("mlp.moe.experts.local_experts"):
+                elif subname.startswith("mlp.deepspeed_moe.experts.deepspeed_experts"):
                     match = self.layer_pat.match(subname)
                     expert_num = int(match.group(2))
                     subname = match.group(3)
@@ -326,6 +326,12 @@ def convert_hf_to_mega_ds():
 
     from megatron.model.deepseek import deepseek_config_from_args
     from megatron.model.deepseek.deepseek_model import DeepSeekV2Model
+    from megatron.model.deepseek.utils import init_deepseek_for_deepspeed
+
+    init_deepseek_for_deepspeed()
+    from megatron.model.deepseek.layers import DeepSeekMoE
+    assert deepspeed.runtime.engine.MoE == DeepSeekMoE, \
+        f"Expect {deepspeed.runtime.engine.MoE.__name__} but got {DeepSeekMoE.__name__}"
 
     config = deepseek_config_from_args(args)
     with deepspeed.zero.Init(

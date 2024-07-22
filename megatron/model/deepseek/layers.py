@@ -258,12 +258,19 @@ class TopKGate(Module):
 
 
 class Experts(Module):
-    def __init__(self, config: DeepSeekTransformerConfig, num_local_experts: int, enable_expert_tensor_parallelism: bool):
+    def __init__(self, config: DeepSeekTransformerConfig, num_local_experts: int, enable_expert_tensor_parallelism: bool, expert_group_name=None):
         super().__init__()
-        self.local_experts = torch.nn.ModuleList()
+        self.deepspeed_experts = torch.nn.ModuleList()
         for _ in range(num_local_experts):
-            self.local_experts.append(ParallelMLP(
+            self.deepspeed_experts.append(ParallelMLP(
                 config, config.moe_ffn_hidden_size, moe=True, enable_expert_tensor_parallelism=enable_expert_tensor_parallelism))
+        self.num_local_experts = num_local_experts
+
+        for expert in self.deepspeed_experts:
+            # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
+            for param in expert.parameters():
+                param.allreduce = False
+                param.group_name = expert_group_name
 
     def forward(self, permuted_hidden_states: Tensor, num_tokens_per_expert: int) -> Tuple[Tensor, Tensor]:
         """
@@ -276,7 +283,7 @@ class Experts(Module):
         # Insert zero at the begining for offset index's convenience
         zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
         cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
-        for expert_id, expert in enumerate(self.local_experts):
+        for expert_id, expert in enumerate(self.deepspeed_experts):
             start = cumsum_num_tokens[expert_id]
             end = cumsum_num_tokens[expert_id + 1]
             input = permuted_hidden_states[start:end]
@@ -395,26 +402,29 @@ class DeepSeekMoE(nn.Module):
         self.ep_size = config.expert_model_parallel_size
         assert config.num_routed_experts % self.ep_size == 0, f"Number of routed experts ({config.num_routed_experts}) should be divisible by expert parallel size ({self.ep_size})"
         self.expert_group_name = f"ep_size_{self.ep_size}"
-        self.num_routed_experts = config.num_routed_experts
-        self.num_local_routed_experts = config.num_routed_experts // self.ep_size
+        self.num_experts = config.num_routed_experts
+        self.num_local_experts = self.num_experts // self.ep_size
         self.num_shared_experts = config.num_shared_experts
 
         log_dist(
-            f'Creating Deepseek MoE layer with num_routed_experts: {self.num_routed_experts} | num_local_routed_experts: {self.num_local_routed_experts} | '
+            f'Creating Deepseek MoE layer with num_routed_experts: {self.num_experts} | num_local_routed_experts: {self.num_local_experts} | '
             f'num_shared_experts: {self.num_shared_experts} | expert_parallel_size: {self.ep_size}'
             [0])
 
         experts = Experts(config,
-                    num_local_experts=self.num_local_routed_experts,
-                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
+                    num_local_experts=self.num_local_experts,
+                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
+                    expert_group_name=self.expert_group_name)
 
-        self.moe = MoELayer(TopKGate(config),
+        self.deepspeed_moe = MoELayer(TopKGate(config),
                         experts,
                         config,
-                        num_local_experts=self.num_local_routed_experts)
+                        num_local_experts=self.num_local_experts)
 
         if config.num_shared_experts is not None:
-            self.shared_experts = ParallelMLP(config,
+            # NOTE: DeepSpeed will recognize routed experts by the word `expert` in the name, so
+            # changed the name to `shared_exp` to make DeepSpeed happy.
+            self.shared_exp = ParallelMLP(config,
                                     config.moe_ffn_hidden_size * config.num_shared_experts,
                                     moe=True,
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
@@ -436,14 +446,14 @@ class DeepSeekMoE(nn.Module):
                 groups._create_expert_data_and_model_parallel(
                     self.ep_size, mpu=groups.mpu, use_data_before_expert_parallel_=use_data_before_expert_parallel_)
         # Set the group handle for the MOELayer (deepspeed_moe) object
-        self.moe._set_ep_group(groups._get_expert_parallel_group(self.expert_group_name))
+        self.deepspeed_moe._set_ep_group(groups._get_expert_parallel_group(self.expert_group_name))
 
     def forward(self, hidden_states):
         identity = hidden_states
-        y = self.moe(identity)
+        y = self.deepspeed_moe(identity)
         if self.config.num_shared_experts is not None:
-            y = y + self.shared_experts(identity)[0]
-        return y, self.moe.l_aux, self.moe.num_tokens_per_expert
+            y = y + self.shared_exp(identity)[0]
+        return y, self.deepspeed_moe.l_aux, self.deepspeed_moe.num_tokens_per_expert
 
 
 DeepseekV2RMSNorm = RMSNorm

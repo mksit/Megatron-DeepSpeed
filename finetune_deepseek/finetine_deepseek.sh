@@ -7,14 +7,16 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 MODEL="deepseek-v2-lite"
 # MODEL="deepseek-coder-v2-lite-base"
 
-HF_LLAMA_PATH=./finetune_deepseek/data/$MODEL
+HF_PATH=./finetune_deepseek/hf_checkpoints/$MODEL
 # weights link: https://huggingface.co/huggyllama/llama-7b
 
-MICRO_BATCH_SIZE=8
+MICRO_BATCH_SIZE=16
 GLOBAL_BATCH_SIZE=256
-TP=4
-EP=4
+TP=8
+EP=8
 ZERO_STAGE=2
+
+NUM_GPUS=8
 
 TRAIN_ITERS=200
 
@@ -38,7 +40,7 @@ MOE_V_HEAD_DIM=128
 ######################################
 
 NAME="${MODEL}-mbs${MICRO_BATCH_SIZE}-z${ZERO_STAGE}-tp${TP}-ep${EP}"
-MEGA_DS_LLAMA_PATH=./finetune_deepseek/checkpoints/${NAME}
+MEGA_DS_PATH="./finetune_deepseek/checkpoints/${MODEL}-tp${TP}-ep${EP}"
 
 cat <<EOT > $DS_CONFIG
 {
@@ -54,14 +56,15 @@ cat <<EOT > $DS_CONFIG
 }
 EOT
 
-distributed_args="--num_gpus=4 --master_addr localhost --master_port 30000"
+distributed_args="--num_gpus=$NUM_GPUS --master_addr localhost --master_port 30000"
 
 convert_args="deepspeed $distributed_args finetune_deepseek/convert_hf_checkpoint.py \
 --hf-ckpt-num-shards 4 \
---input-dir $HF_LLAMA_PATH \
---save $MEGA_DS_LLAMA_PATH"
+--input-dir $HF_PATH \
+--save $MEGA_DS_PATH"
 
-finetune_args="deepspeed $distributed_args pretrain_deepseek.py"
+finetune_args="deepspeed $distributed_args pretrain_deepseek.py \
+--load $MEGA_DS_PATH"
 
 parallelism_args="\
 --tensor-model-parallel-size $TP \
@@ -78,6 +81,7 @@ deepseek_args="\
 --qk-nope-head-dim $MOE_QK_NOPE_HEAD_DIM \
 --qk-rope-head-dim $MOE_QK_ROPE_HEAD_DIM \
 --v-head-dim $MOE_V_HEAD_DIM 
+--create-moe-param-group
 "
 
 deepspeed_args="\
@@ -121,7 +125,7 @@ common_args="\
 --bf16 \
 --zero-stage ${ZERO_STAGE} \
 --tokenizer-type HFTokenizer \
---tokenizer-model $HF_LLAMA_PATH \
+--tokenizer-model $HF_PATH \
 --distributed-backend nccl \
 --num-workers 0 \
 --no-masked-softmax-fusion \
@@ -137,12 +141,14 @@ $parallelism_args"
 log_dir="./logs"
 mkdir -p $log_dir
 
+current_time=$(date "+%Y-%m-%d_%H-%M-%S")
+
 if [ "$1" = "convert" ]; then
     task_args="$convert_args"
-    log_file="$log_dir/convert_${NAME}.log"
+    log_file="$log_dir/convert_${NAME}_${current_time}.log"
 else
     task_args="$finetune_args"
-    log_file="$log_dir/finetune_${NAME}.log"
+    log_file="$log_dir/finetune_${NAME}_${current_time}.log"
 fi
 
 full_cmd="$task_args $common_args &> $log_file"

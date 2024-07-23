@@ -11,6 +11,7 @@ from torch.nn import init
 import importlib
 from torch.nn import functional as F
 import inspect
+from torch._guards import detect_fake_mode
 
 from megatron.core.utils import make_viewless_tensor
 
@@ -56,8 +57,8 @@ class MixedFusedLayerNorm(torch.nn.Module):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = torch.Size(normalized_shape)
         self.eps = eps
-        self.weight = Parameter(torch.Tensor(*normalized_shape))
-        self.bias = Parameter(torch.Tensor(*normalized_shape))
+        self.weight = Parameter(torch.empty(*normalized_shape))
+        self.bias = Parameter(torch.empty(*normalized_shape))
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
         self.sequence_parallel = sequence_parallel
@@ -83,6 +84,10 @@ class MixedFusedLayerNorm(torch.nn.Module):
     if not input.is_cuda:
         print("WARNING! The input of FusedLayerNorm should be on the GPU."
               "This warning should only be triggered in the FusedLayerNorm unit tests.")
+        return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
+
+    # Compactron: use Pytorch's layer_norm if fake mode is detected
+    if detect_fake_mode(input) is not None:
         return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
 
     if self.no_persist_layer_norm:

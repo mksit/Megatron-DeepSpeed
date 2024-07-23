@@ -671,7 +671,7 @@ class ParallelAttention(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None, **kwargs):
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -1643,8 +1643,8 @@ class ParallelTransformer(MegatronModule):
                                           layer_type==LayerType.decoder)
 
         self.drop_path_rates = [
-            rate.item() for rate in
-            torch.linspace(0, self.drop_path_rate, config.num_layers)]
+            rate for rate in
+            np.linspace(0, self.drop_path_rate, config.num_layers)]
 
         self.retro_layer_numbers = None
         if model_type == ModelType.retro_decoder:

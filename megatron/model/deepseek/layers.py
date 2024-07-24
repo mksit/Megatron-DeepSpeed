@@ -265,6 +265,7 @@ class Experts(Module):
             self.deepspeed_experts.append(ParallelMLP(
                 config, config.moe_ffn_hidden_size, moe=True, enable_expert_tensor_parallelism=enable_expert_tensor_parallelism))
         self.num_local_experts = num_local_experts
+        self.ep_size = config.expert_model_parallel_size
 
         for expert in self.deepspeed_experts:
             # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
@@ -272,12 +273,30 @@ class Experts(Module):
                 param.allreduce = False
                 param.group_name = expert_group_name
 
+        from torch._guards import active_fake_mode
+        self._in_fake_mode = active_fake_mode()
+
     def forward(self, permuted_hidden_states: Tensor, num_tokens_per_expert: int) -> Tuple[Tensor, Tensor]:
         """
         permuted_states: tokens sorted in the ascending order of local experts. (e.g. [e0, e0, e0, e1, e1])
         num_tokens_per_expert: number of tokens for each expert
         """
         expert_output = torch.zeros_like(permuted_hidden_states)
+
+        # Bypass the normal expert computation to avoid data dependent  
+        # operations in fake mode. The computation and memory usage should be
+        # the same as the normal mode, but you should NEVER use the value of the result.
+        if self._in_fake_mode:
+            hidden_shape = permuted_hidden_states.shape
+            hidden_states = permuted_hidden_states.reshape(self.ep_size, self.num_local_experts, -1, hidden_shape[-1])
+            chunks = hidden_states.chunk(self.num_local_experts, dim=1)
+            expert_outputs: list[torch.Tensor] = []
+            for chunk, expert in zip(chunks, self.deepspeed_experts):
+                out, _ = expert(chunk)
+                expert_outputs += [out]
+            expert_output = torch.cat(expert_outputs, dim=1)
+            expert_output = expert_output.reshape(hidden_shape)
+            return expert_output
 
         cumsum_num_tokens = torch.cumsum(num_tokens_per_expert, dim=0)
         # Insert zero at the begining for offset index's convenience

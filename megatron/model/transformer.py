@@ -7,6 +7,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch._guards import active_fake_mode
 from typing import Optional
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
@@ -903,6 +904,11 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = config.bf16
         self.fp32_residual_connection = config.fp32_residual_connection
 
+        # Revert to local RMSNorm if fake mode is active
+        if active_fake_mode():
+            from .rmsnorm import RMSNorm as LocalRMSNorm
+            RMSNorm = LocalRMSNorm
+
         # Layernorm on the input data.
         if args.normalization == 'layernorm':
             if get_accelerator().device_name() == 'cuda':
@@ -1768,6 +1774,11 @@ class ParallelTransformer(MegatronModule):
                         layer.self_attention.core_attention.attention_dropout.p =\
                             args.retro_encoder_attention_dropout
                     layer.hidden_dropout = args.retro_encoder_hidden_dropout
+
+        # Revert to local RMSNorm if fake mode is active
+        if active_fake_mode():
+            from .rmsnorm import RMSNorm as LocalRMSNorm
+            RMSNorm = LocalRMSNorm
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.

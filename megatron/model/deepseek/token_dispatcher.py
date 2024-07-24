@@ -131,6 +131,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Valid sync points are "before_permutation_1", "before_ep_alltoall", "before_finish", and "no_sync".
         self.cuda_sync_point = "no_sync"
 
+        from torch._guards import active_fake_mode
+        self._in_fake_mode = active_fake_mode()
+
     def preprocess(self, indices: torch.Tensor) -> torch.Tensor:
         """
         Preprocess token indices for AlltoAll communication and token permutation. This method computes the number of tokens assigned to each expert based on the input indices.
@@ -238,6 +241,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 - Permuted token embeddings for local experts.
                 - Number of tokens per expert.
         """
+        # Bypass the normal dispatching to avoid dynamism if we are in fake mode.
+        # We want to mimic the communication and memory usage only, so you should 
+        # NEVER use the value of the result.
+        if self._in_fake_mode:
+            hidden_states = all_to_all(self.ep_group, hidden_states)
+            return hidden_states.contiguous(), torch.zeros(self.num_local_experts, dtype=torch.long)
+        
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
         self.probs = probs
@@ -324,6 +334,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         #     hidden_states = tensor_parallel.reduce_scatter_last_dim_to_tensor_parallel_region(
         #         hidden_states
         #     )
+
+        # Bypass the normal dispatching to avoid dynamism if we are in fake mode.
+        # We want to mimic the communication and memory usage only, so you should 
+        # NEVER use the value of the result.
+        if self._in_fake_mode:
+            hidden_states = all_to_all(self.ep_group, hidden_states)
+            return hidden_states, None
 
         # Unpermutation 2: expert output to AlltoAll input
         if self.num_local_experts > 1:
